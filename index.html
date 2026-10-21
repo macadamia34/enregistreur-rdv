@@ -378,7 +378,9 @@ function segments(a){
   return segs;
 }
 const HALLU=/^(sous-titr(age|es)|merci d'avoir regardé|abonnez-vous|n'hésitez pas à vous abonner|♪|\.\.\.|merci\.?)$/i;
-function clean(t){ t=t.trim(); return t.split(/(?<=[.!?])\s+/).filter(x=>!/sous-titrage|amara\.org|radio-canada/i.test(x)).join(" ").trim(); }
+// Whisper part parfois en boucle (« on va y parler, on va y parler… ») : on ne garde qu'une occurrence
+function collapse(t){ let p; do{ p=t; t=t.replace(/((?:[^\s]+[\s,.!?;:-]*){1,8}?)\1{2,}/g,"$1"); }while(t!==p); return t.replace(/\s{2,}/g," ").trim(); }
+function clean(t){ t=collapse(t.trim()); return t.split(/(?<=[.!?])\s+/).filter(x=>!/sous-titrage|amara\.org|radio-canada/i.test(x)).join(" ").trim(); }
 
 /* ---------- worker de transcription ---------- */
 const workerSrc=`
@@ -404,7 +406,7 @@ self.onmessage=async(e)=>{
       self.postMessage({type:"ready"});
     }
     if(m.type==="run"){
-      const r=await asr(m.audio,{language:"french",task:"transcribe"});
+      const r=await asr(m.audio,{language:"french",task:"transcribe",no_repeat_ngram_size:8});
       self.postMessage({type:"text",text:r.text||""});
     }
   }catch(err){ self.postMessage({type:"error",message:String(err&&err.message||err)}); }
