@@ -1,0 +1,366 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Enregistreur RDV client</title>
+<meta name="robots" content="noindex,nofollow">
+<meta name="referrer" content="no-referrer">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Enregistreur RDV">
+<link rel="apple-touch-icon" href="icon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Serif:wght@500;600&family=IBM+Plex+Mono:wght@500&display=swap">
+<style>
+/* Layout: one working column, three steps (source audio → transcription → envoi vers Claude) */
+:root{
+  --bg:#f3f5f6; --surface:#fff; --fg:#1b2428; --muted:#5d6b71; --line:#d8dfe2;
+  --accent:#1f5c66; --accent-soft:#e3eef0; --on-accent:#fff; --rec:#b3261e; --rec-soft:#fbe7e5; --warn:#8a5a00; --warn-soft:#fbf1dc;
+  --serif:"IBM Plex Serif",Georgia,serif; --sans:"IBM Plex Sans",system-ui,-apple-system,"Segoe UI",sans-serif; --mono:"IBM Plex Mono",ui-monospace,Menlo,monospace;
+  color-scheme:light;
+}
+@media (prefers-color-scheme:dark){:root{
+  --bg:#121719; --surface:#1a2124; --fg:#e4eaec; --muted:#97a6ab; --line:#2c3639;
+  --accent:#6fb3bd; --accent-soft:#1d3135; --on-accent:#0d1416; --rec:#f08a80; --rec-soft:#3a1f1d; --warn:#e0b25c; --warn-soft:#2e2615; color-scheme:dark}}
+*{box-sizing:border-box}
+[hidden]{display:none!important}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 var(--sans);padding:24px max(16px,env(safe-area-inset-right)) 56px max(16px,env(safe-area-inset-left))}
+.wrap{max-width:760px;margin:0 auto;display:flex;flex-direction:column;gap:18px}
+h1{font-family:var(--serif);font-weight:600;font-size:1.7rem;margin:0}
+header p{margin:4px 0 0;color:var(--muted)}
+section{background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:18px;display:flex;flex-direction:column;gap:12px;min-width:0}
+.step{display:flex;gap:10px;align-items:baseline}
+.step b{font-family:var(--serif);color:var(--accent)}
+.step h2{font-family:var(--serif);font-weight:600;font-size:1.15rem;margin:0}
+.muted{color:var(--muted)} .small{font-size:.86rem}
+.cols{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+@media (max-width:600px){.cols{grid-template-columns:1fr}}
+.pane{border:1px solid var(--line);border-radius:8px;padding:14px;display:flex;flex-direction:column;gap:10px;min-width:0}
+.pane h3{margin:0;font-size:.95rem}
+.timer{font-family:var(--mono);font-size:2rem;font-variant-numeric:tabular-nums;letter-spacing:.02em}
+.rec .timer{color:var(--rec)}
+.dot{display:inline-block;width:10px;height:10px;border-radius:50%;background:var(--rec);margin-right:6px;vertical-align:middle}
+@media (prefers-reduced-motion:no-preference){.rec .dot{animation:blink 1s steps(2) infinite}@keyframes blink{50%{opacity:.2}}}
+canvas{width:100%;height:40px;display:block}
+.drop{border:1.5px dashed var(--line);border-radius:8px;padding:18px 12px;text-align:center;cursor:pointer;position:relative}
+.drop.over{border-color:var(--accent);background:var(--accent-soft)}
+.drop input{position:absolute;inset:0;opacity:0;cursor:pointer}
+.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+button,.btn{font:inherit;font-weight:500;border-radius:8px;padding:9px 14px;border:1px solid var(--line);background:var(--surface);color:var(--fg);cursor:pointer;text-decoration:none;display:inline-block}
+button.primary,.btn.primary{background:var(--accent);border-color:var(--accent);color:var(--on-accent)}
+button.recbtn{background:var(--rec);border-color:var(--rec);color:#fff}
+button:disabled{opacity:.5;cursor:default}
+button:focus-visible,.btn:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+label{display:flex;flex-direction:column;gap:4px;font-size:.82rem;font-weight:500;color:var(--muted)}
+label.inline{flex-direction:row;align-items:center;gap:6px;font-weight:400;color:var(--fg);font-size:.9rem}
+input,select,textarea{font:inherit;color:var(--fg);background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:8px 10px;width:100%}
+label.inline input{width:auto}
+textarea{min-height:260px;resize:vertical;line-height:1.5}
+.source{background:var(--accent-soft);border-radius:8px;padding:10px 12px;font-size:.9rem}
+.bar{height:8px;background:var(--line);border-radius:4px;overflow:hidden}
+.bar i{display:block;height:100%;width:0;background:var(--accent);transition:width .3s}
+.note{background:var(--warn-soft);border-radius:8px;padding:10px 12px;font-size:.88rem}
+.note b{color:var(--warn)}
+.err{color:var(--rec);font-size:.9rem}
+.num{font-variant-numeric:tabular-nums}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Enregistreur RDV client</h1>
+    <p>Enregistrez l'entretien ou déposez un fichier audio. La transcription se fait sur cet ordinateur : aucun son ne sort de la machine.</p>
+  </header>
+
+  <section>
+    <div class="step"><b>1</b><h2>L'audio</h2></div>
+    <div class="cols">
+      <div class="pane" id="recPane">
+        <h3>Enregistrer maintenant</h3>
+        <div class="timer num" id="timer"><span class="dot" hidden id="dot"></span>00:00:00</div>
+        <canvas id="meter" width="600" height="80" aria-hidden="true"></canvas>
+        <div class="row">
+          <button type="button" class="recbtn" id="recStart">Démarrer</button>
+          <button type="button" id="recPause" hidden>Pause</button>
+          <button type="button" id="recStop" hidden>Terminer</button>
+        </div>
+      </div>
+      <div class="pane">
+        <h3>Déposer un fichier</h3>
+        <label class="drop" id="drop" for="file">
+          <span>Glissez un mp3, m4a, wav… ici<br><span class="muted small">ou cliquez pour choisir</span></span>
+          <input id="file" type="file" accept="audio/*,video/mp4,.mp3,.m4a,.wav,.ogg,.webm,.aac,.flac">
+        </label>
+      </div>
+    </div>
+    <div class="source" id="source" hidden></div>
+    <div class="row" id="audioActions" hidden>
+      <audio id="player" controls style="width:100%;max-width:100%"></audio>
+      <a class="btn" id="saveAudio" download hidden>Sauvegarder l'enregistrement</a>
+    </div>
+    <p class="note"><b>Avant d'enregistrer</b> : informez le client et recueillez son accord en début d'entretien. Pensez à sauvegarder l'enregistrement : il disparaît à la fermeture de la page.</p>
+  </section>
+
+  <section>
+    <div class="step"><b>2</b><h2>Transcription</h2></div>
+    <div class="cols">
+      <label for="model">Modèle
+        <select id="model">
+          <option value="base">Rapide (moins précis)</option>
+          <option value="small" selected>Équilibré (recommandé)</option>
+          <option value="turbo">Précis (carte graphique récente)</option>
+        </select>
+      </label>
+      <div style="display:flex;flex-direction:column;justify-content:flex-end;gap:6px">
+        <label class="inline"><input type="checkbox" id="stamps" checked> Repères de temps [mm:ss]</label>
+        <span class="muted small" id="device">Détection du matériel…</span>
+      </div>
+    </div>
+    <div class="row">
+      <button type="button" class="primary" id="go" disabled>Transcrire</button>
+      <button type="button" id="stop" hidden>Arrêter</button>
+      <span class="small muted num" id="status">Choisissez d'abord un audio.</span>
+    </div>
+    <div class="bar" id="barWrap" hidden><i id="bar"></i></div>
+    <p class="small muted">Première utilisation : le modèle est téléchargé une fois (150 Mo à 1,5 Go selon le choix). Comptez ensuite environ 5 à 15 min de calcul pour 1 h d'entretien avec une carte graphique, nettement plus sans.</p>
+    <div class="err" id="err" hidden></div>
+    <textarea id="tx" placeholder="La transcription apparaîtra ici, au fur et à mesure. Vous pouvez la corriger."></textarea>
+  </section>
+
+  <section>
+    <div class="step"><b>3</b><h2>Vers Claude</h2></div>
+    <div class="cols">
+      <label for="client">Client / dossier<input id="client" placeholder="SARL Martin Menuiserie"></label>
+      <label for="date">Date du RDV<input id="date" type="date"></label>
+    </div>
+    <div class="row">
+      <button type="button" class="primary" id="copy">Copier la transcription</button>
+      <a class="btn" href="https://claude.ai/artifact/7zG5XXTM4Mt8J8rj2GzYph" target="_blank" rel="noopener">Ouvrir Récap RDV client</a>
+      <button type="button" id="dlTxt">Télécharger .txt</button>
+      <span class="small muted" id="copyStatus"></span>
+    </div>
+    <p class="small muted">Collez la transcription dans Récap RDV client, puis choisissez « Email au client » ou « Note de dossier ».</p>
+  </section>
+</div>
+
+<script>
+const $=id=>document.getElementById(id);
+const TF="https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1/dist/transformers.min.js";
+const MODELS={
+  base:{id:"onnx-community/whisper-base"},
+  small:{id:"onnx-community/whisper-small"},
+  turbo:{id:"onnx-community/whisper-large-v3-turbo"}
+};
+const SR=16000;
+let audio=null, audioName="", worker=null, stopFlag=false, gpu={webgpu:false,f16:false}, dirty=false, wakeLock=null;
+
+/* ---------- matériel ---------- */
+(async()=>{
+  try{ if(navigator.gpu){ const a=await navigator.gpu.requestAdapter(); if(a){ gpu.webgpu=true; gpu.f16=a.features.has("shader-f16"); } } }catch(e){}
+  $("device").textContent = gpu.webgpu ? "Carte graphique détectée : transcription accélérée." : "Pas d'accélération graphique : la transcription sera plus lente.";
+  if(!(gpu.webgpu&&gpu.f16)){ $("model").querySelector('[value="turbo"]').disabled=true; }
+})();
+async function keepAwake(on){
+  try{ if(on && !wakeLock && navigator.wakeLock){ wakeLock=await navigator.wakeLock.request("screen"); }
+       if(!on && wakeLock){ await wakeLock.release(); wakeLock=null; } }catch(e){}
+}
+
+/* ---------- enregistrement ---------- */
+let rec=null, recChunks=[], stream=null, t0=0, elapsed=0, tick=null, ac=null, analyser=null, raf=null;
+const fmt=s=>{s=Math.floor(s);return [s/3600|0,(s%3600)/60|0,s%60].map(n=>String(n).padStart(2,"0")).join(":")};
+function showTime(){ const s=elapsed+(rec&&rec.state==="recording"?(performance.now()-t0)/1000:0); $("timer").lastChild.textContent=fmt(s); }
+function draw(){
+  const c=$("meter"),g=c.getContext("2d"),d=new Uint8Array(analyser.fftSize); analyser.getByteTimeDomainData(d);
+  g.clearRect(0,0,c.width,c.height); g.strokeStyle=getComputedStyle(document.documentElement).getPropertyValue("--rec"); g.lineWidth=2; g.beginPath();
+  for(let i=0;i<d.length;i++){ const x=i/d.length*c.width, y=d[i]/255*c.height; i?g.lineTo(x,y):g.moveTo(x,y); } g.stroke();
+  raf=requestAnimationFrame(draw);
+}
+$("recStart").onclick=async()=>{
+  $("err").hidden=true;
+  try{ stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true}}); }
+  catch(e){ showErr("Micro inaccessible. Autorisez le micro pour cette page dans le navigateur (icône à gauche de la barre d'adresse), puis réessayez."); return; }
+  recChunks=[]; elapsed=0;
+  const mime=["audio/webm;codecs=opus","audio/mp4","audio/ogg;codecs=opus"].find(m=>window.MediaRecorder&&MediaRecorder.isTypeSupported(m))||"";
+  rec=new MediaRecorder(stream, mime?{mimeType:mime,audioBitsPerSecond:48000}:{});
+  rec.ondataavailable=e=>{ if(e.data.size) recChunks.push(e.data); };
+  rec.onstop=onRecStop;
+  rec.start(5000); t0=performance.now();
+  ac=new AudioContext(); analyser=ac.createAnalyser(); analyser.fftSize=1024; ac.createMediaStreamSource(stream).connect(analyser); draw();
+  tick=setInterval(showTime,250); keepAwake(true); dirty=true;
+  $("recPane").classList.add("rec"); $("dot").hidden=false;
+  $("recStart").hidden=true; $("recPause").hidden=false; $("recStop").hidden=false; $("recPause").textContent="Pause";
+};
+$("recPause").onclick=()=>{
+  if(rec.state==="recording"){ rec.pause(); elapsed+=(performance.now()-t0)/1000; $("recPause").textContent="Reprendre"; $("recPane").classList.remove("rec"); }
+  else { rec.resume(); t0=performance.now(); $("recPause").textContent="Pause"; $("recPane").classList.add("rec"); }
+};
+$("recStop").onclick=()=>{ if(rec.state==="recording") elapsed+=(performance.now()-t0)/1000; rec.stop(); };
+async function onRecStop(){
+  clearInterval(tick); cancelAnimationFrame(raf); stream.getTracks().forEach(t=>t.stop()); ac&&ac.close(); keepAwake(false);
+  $("recPane").classList.remove("rec"); $("dot").hidden=true;
+  $("recStart").hidden=false; $("recStart").textContent="Nouvel enregistrement"; $("recPause").hidden=true; $("recStop").hidden=true;
+  const blob=new Blob(recChunks,{type:rec.mimeType||"audio/webm"});
+  const ext=/mp4/.test(blob.type)?"m4a":/ogg/.test(blob.type)?"ogg":"webm";
+  const d=new Date(), name=`rdv_${d.toISOString().slice(0,10)}_${String(d.getHours()).padStart(2,"0")}h${String(d.getMinutes()).padStart(2,"0")}.${ext}`;
+  await loadAudio(blob, name, true);
+}
+
+/* ---------- fichier ---------- */
+const drop=$("drop");
+["dragenter","dragover"].forEach(ev=>drop.addEventListener(ev,e=>{e.preventDefault();drop.classList.add("over")}));
+["dragleave","drop"].forEach(ev=>drop.addEventListener(ev,()=>drop.classList.remove("over")));
+drop.addEventListener("drop",e=>{e.preventDefault(); const f=e.dataTransfer.files[0]; if(f) loadAudio(f,f.name,false);});
+$("file").onchange=e=>{ const f=e.target.files[0]; if(f) loadAudio(f,f.name,false); e.target.value=""; };
+
+async function loadAudio(blob,name,isRec){
+  $("err").hidden=true; $("go").disabled=true; $("status").textContent="Lecture de l'audio…";
+  const url=URL.createObjectURL(blob); $("player").src=url; $("audioActions").hidden=false;
+  $("saveAudio").hidden=!isRec; if(isRec){ $("saveAudio").href=url; $("saveAudio").download=name; }
+  try{
+    const buf=await blob.arrayBuffer();
+    const ctx=new (window.AudioContext||window.webkitAudioContext)({sampleRate:SR});
+    const ab=await ctx.decodeAudioData(buf); ctx.close();
+    const n=ab.length, out=new Float32Array(n), ch=ab.numberOfChannels;
+    for(let c=0;c<ch;c++){ const d=ab.getChannelData(c); for(let i=0;i<n;i++) out[i]+=d[i]/ch; }
+    audio=out; audioName=name;
+    $("source").hidden=false; $("source").textContent=`${isRec?"Enregistrement":"Fichier"} : ${name} — durée ${fmt(n/SR)}`;
+    $("go").disabled=false; $("status").textContent="Prêt à transcrire.";
+  }catch(e){
+    audio=null; $("status").textContent=""; showErr("Ce fichier audio n'a pas pu être lu par le navigateur. Essayez un mp3, m4a ou wav, ou utilisez Chrome.");
+  }
+}
+
+/* ---------- découpage en segments de ~28 s, coupés sur un silence ---------- */
+function segments(a){
+  const segs=[], max=28*SR, look=4*SR, win=SR/50;
+  let s=0;
+  while(s<a.length){
+    let e=Math.min(s+max,a.length);
+    if(e<a.length){ // chercher le passage le plus calme dans les 4 dernières secondes
+      let best=e, bestE=Infinity;
+      for(let p=e-look;p<e;p+=win){ let en=0; for(let i=p;i<p+win;i++) en+=a[i]*a[i]; if(en<bestE){bestE=en;best=p+(win>>1);} }
+      e=best;
+    }
+    let en=0; for(let i=s;i<e;i+=4) en+=a[i]*a[i]; const rms=Math.sqrt(en/((e-s)/4));
+    segs.push({start:s,end:e,silent:rms<0.004});
+    s=e;
+  }
+  return segs;
+}
+// Phrases que Whisper invente sur les silences
+const HALLU=/^(sous-titr(age|es)|merci d'avoir regardé|abonnez-vous|n'hésitez pas à vous abonner|♪|\.\.\.|merci\.?)$/i;
+function clean(t){ t=t.trim(); return t.split(/(?<=[.!?])\s+/).filter(x=>!/sous-titrage|amara\.org|radio-canada/i.test(x)).join(" ").trim(); }
+
+/* ---------- worker de transcription ---------- */
+const workerSrc=`
+import { pipeline, env } from "${TF}";
+env.allowLocalModels=false;
+env.useBrowserCache = (typeof caches!=="undefined");
+let asr=null, key=null;
+self.onmessage=async(e)=>{
+  const m=e.data;
+  try{
+    if(m.type==="load"){
+      if(key!==m.key){
+        asr=null;
+        const files={};
+        asr=await pipeline("automatic-speech-recognition", m.model, {
+          device:m.device, dtype:m.dtype,
+          progress_callback:p=>{ if(p.status==="progress"&&p.total){ files[p.file]=[p.loaded,p.total]; let l=0,t=0; for(const k in files){l+=files[k][0];t+=files[k][1];} self.postMessage({type:"dl",loaded:l,total:t}); } }
+        });
+        key=m.key;
+      }
+      self.postMessage({type:"ready"});
+    }
+    if(m.type==="run"){
+      const r=await asr(m.audio,{language:"french",task:"transcribe"});
+      self.postMessage({type:"text",i:m.i,text:r.text||""});
+    }
+  }catch(err){ self.postMessage({type:"error",message:String(err&&err.message||err)}); }
+};`;
+function getWorker(){
+  if(!worker){ worker=new Worker(URL.createObjectURL(new Blob([workerSrc],{type:"text/javascript"})),{type:"module"}); }
+  return worker;
+}
+function ask(msg,transfer){
+  return new Promise((res,rej)=>{
+    const w=getWorker();
+    const h=e=>{ const d=e.data;
+      if(d.type==="dl"){ const pct=d.loaded/d.total*100; $("bar").style.width=pct+"%"; $("status").textContent=`Téléchargement du modèle (première fois) : ${(d.loaded/1048576).toFixed(0)} / ${(d.total/1048576).toFixed(0)} Mo`; return; }
+      w.removeEventListener("message",h); w.removeEventListener("error",fail);
+      d.type==="error"?rej(new Error(d.message)):res(d);
+    };
+    // Si le moteur ne se charge pas (réseau, navigateur), le signaler au lieu de rester bloqué
+    const fail=ev=>{ ev.preventDefault&&ev.preventDefault(); w.removeEventListener("message",h); w.removeEventListener("error",fail);
+      worker=null; rej(new Error("le moteur de transcription n'a pas pu démarrer dans ce navigateur"+(ev.message?" ("+ev.message+")":""))); };
+    w.addEventListener("message",h); w.addEventListener("error",fail); w.postMessage(msg,transfer||[]);
+  });
+}
+
+$("go").onclick=async()=>{
+  if(!audio) return;
+  $("err").hidden=true; stopFlag=false; dirty=true;
+  const choice=$("model").value, device=gpu.webgpu?"webgpu":"wasm";
+  const dtype = device==="webgpu"
+    ? (choice==="turbo"?{encoder_model:"fp16",decoder_model_merged:"q4"}:{encoder_model:"fp32",decoder_model_merged:"q4"})
+    : "q8";
+  $("go").disabled=true; $("stop").hidden=false; $("barWrap").hidden=false; $("bar").style.width="0";
+  $("status").textContent="Chargement du modèle…"; keepAwake(true);
+  if($("tx").value.trim()){ $("tx").value+="\n\n"; }
+  const prefixLen=$("tx").value.length;
+  try{
+    await ask({type:"load",model:MODELS[choice].id,device,dtype,key:choice+device});
+    const segs=segments(audio), t1=performance.now(); let doneSec=0;
+    for(let i=0;i<segs.length;i++){
+      if(stopFlag) break;
+      const sg=segs[i];
+      if(!sg.silent){
+        const chunk=audio.slice(sg.start,sg.end);
+        const r=await ask({type:"run",i,audio:chunk},[chunk.buffer]);
+        const t=clean(r.text);
+        if(t && !HALLU.test(t)){
+          const line=($("stamps").checked?`[${fmt(sg.start/SR).replace(/^00:/,"")}] `:"")+t;
+          $("tx").value+=( $("tx").value.length>prefixLen ? "\n" : "" )+line;
+          $("tx").scrollTop=$("tx").scrollHeight;
+        }
+      }
+      doneSec=sg.end/SR;
+      const pct=sg.end/audio.length*100, el=(performance.now()-t1)/1000, rest=el/sg.end*(audio.length-sg.end);
+      $("bar").style.width=pct+"%";
+      $("status").textContent=`Transcription : ${fmt(doneSec)} / ${fmt(audio.length/SR)} — reste environ ${Math.max(1,Math.round(rest/60))} min`;
+    }
+    $("status").textContent= stopFlag ? `Arrêté à ${fmt(doneSec)}.` : "Transcription terminée. Relisez-la, puis copiez-la vers Claude.";
+  }catch(e){
+    showErr("La transcription a échoué : "+e.message+(choice!=="base"?" — essayez le modèle « Rapide ».":""));
+    $("status").textContent="";
+    worker&&worker.terminate(); worker=null;
+  }finally{
+    $("go").disabled=false; $("stop").hidden=true; keepAwake(false);
+  }
+};
+$("stop").onclick=()=>{ stopFlag=true; $("status").textContent="Arrêt après le segment en cours…"; };
+
+/* ---------- vers Claude ---------- */
+$("date").value=new Date().toISOString().slice(0,10);
+function exportText(){
+  const d=$("date").value?new Date($("date").value+"T12:00").toLocaleDateString("fr-FR",{day:"numeric",month:"long",year:"numeric"}):"";
+  const head=[$("client").value&&"Client : "+$("client").value, d&&"Date du rendez-vous : "+d].filter(Boolean).join("\n");
+  return (head?head+"\n\n":"")+$("tx").value.trim();
+}
+$("copy").onclick=async()=>{
+  const t=exportText(); if(!$("tx").value.trim()){ $("copyStatus").textContent="Rien à copier pour l'instant."; return; }
+  try{ await navigator.clipboard.writeText(t); $("copyStatus").textContent="Copié. Collez-le dans Récap RDV client."; }
+  catch(e){ $("tx").select(); $("copyStatus").textContent="Copie automatique refusée : le texte est sélectionné, faites Ctrl+C."; }
+};
+$("dlTxt").onclick=()=>{
+  const c=($("client").value||"rdv").normalize("NFD").replace(/[̀-ͯ]/g,"").replace(/[^\w]+/g,"-").replace(/^-|-$/g,"")||"rdv";
+  const a=document.createElement("a"); a.href=URL.createObjectURL(new Blob([exportText()],{type:"text/plain;charset=utf-8"}));
+  a.download=`${$("date").value}_transcription_${c}.txt`; a.click();
+};
+$("tx").addEventListener("input",()=>dirty=true);
+function showErr(m){ $("err").textContent=m; $("err").hidden=false; }
+window.addEventListener("beforeunload",e=>{ if(dirty||(rec&&rec.state!=="inactive")){ e.preventDefault(); e.returnValue=""; } });
+</script>
+</body>
+</html>
