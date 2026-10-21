@@ -63,6 +63,7 @@ textarea{min-height:260px;resize:vertical;line-height:1.5}
 .note{background:var(--warn-soft);border-radius:8px;padding:10px 12px;font-size:.88rem}
 .note b{color:var(--warn)}
 .err{color:var(--rec);font-size:.9rem}
+#visioOpts .seg{display:flex;gap:14px;flex-wrap:wrap}
 .info{background:var(--accent-soft);color:var(--accent);border-radius:8px;padding:10px 12px;font-size:.9rem;font-weight:500}
 #wipe{color:var(--rec)}
 .num{font-variant-numeric:tabular-nums}
@@ -84,7 +85,13 @@ textarea{min-height:260px;resize:vertical;line-height:1.5}
         <canvas id="meter" width="600" height="80" aria-hidden="true"></canvas>
         <div id="visioBox" hidden>
           <label class="inline"><input type="checkbox" id="visio"> Visio : enregistrer aussi mes interlocuteurs</label>
-          <p class="small muted" style="margin:4px 0 0">Au démarrage, choisissez l'onglet de la visio (Meet, Teams, Zoom dans le navigateur) et cochez « Partager l'audio de l'onglet ». Un casque évite l'écho.</p>
+          <div id="visioOpts" hidden>
+            <div class="seg" role="radiogroup" aria-label="Casque" style="margin-top:6px">
+              <label class="inline"><input type="radio" name="hs" id="hsYes" value="yes" checked> Avec casque</label>
+              <label class="inline"><input type="radio" name="hs" id="hsNo" value="no"> Sans casque</label>
+            </div>
+            <p class="small muted" id="visioHelp" style="margin:4px 0 0"></p>
+          </div>
         </div>
         <div class="row">
           <button type="button" class="recbtn" id="recStart">Démarrer</button>
@@ -185,7 +192,9 @@ function notice(m){ $("notice").textContent=m; $("notice").hidden=!m; }
 (async()=>{
   if(!MOBILE){ try{ if(navigator.gpu){ const a=await navigator.gpu.requestAdapter(); if(a){ gpu.webgpu=true; gpu.f16=a.features.has("shader-f16"); } } }catch(e){} }
   const turbo=$("model").querySelector('[value="turbo"]');
-  if(!MOBILE && navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia) $("visioBox").hidden=false;
+  if(!MOBILE && navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia){ $("visioBox").hidden=false;
+    try{ const v=JSON.parse(localStorage.getItem("erdv-visio")||"{}"); $("visio").checked=!!v.on; (v.hs==="no"?$("hsNo"):$("hsYes")).checked=true; }catch(e){}
+    visioUI(); }
   if(MOBILE){
     // Sur iPhone, Safari ferme la page au-delà du modèle « Rapide » (mémoire insuffisante)
     const small=$("model").querySelector('[value="small"]');
@@ -217,14 +226,18 @@ function recName(ext){ const d=new Date(); return `rdv_${d.toISOString().slice(0
 $("recStart").onclick=async()=>{
   $("err").hidden=true; notice("");
   if(busy){ showErr("Attendez la fin de la transcription en cours avant d'enregistrer."); return; }
-  try{ stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true}}); }
+  const visio=!MOBILE&&$("visio").checked, headset=$("hsYes").checked;
+  // Sans casque : le micro capte aussi les haut-parleurs, donc on coupe le filtre d'écho pour garder la voix des interlocuteurs
+  const roomMode=visio&&!headset;
+  try{ stream=await navigator.mediaDevices.getUserMedia({audio:roomMode?{echoCancellation:false,noiseSuppression:false,autoGainControl:true}:{echoCancellation:true,noiseSuppression:true,autoGainControl:true}}); }
   catch(e){ showErr("Micro inaccessible. Autorisez le micro pour ce site (Réglages > Safari > Micro, ou l'icône « aA » dans la barre d'adresse), puis réessayez."); return; }
   recChunks=[]; chunkWrites=[]; elapsed=0;
   try{ await DB.clearChunks(); }catch(e){}
   const mime=["audio/mp4","audio/webm;codecs=opus","audio/ogg;codecs=opus"].find(m=>window.MediaRecorder&&MediaRecorder.isTypeSupported(m))||"";
   // Visio : capter aussi le son de l'onglet ou de l'ordinateur (les interlocuteurs)
   let recStream=stream;
-  if(!MOBILE && $("visio").checked){
+  if(roomMode) notice("Visio sans casque : le micro enregistre la pièce, haut-parleurs compris. Montez un peu le volume.");
+  if(visio && headset){
     try{ disp=await navigator.mediaDevices.getDisplayMedia({video:true,audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false},systemAudio:"include",selfBrowserSurface:"exclude",surfaceSwitching:"include"}); }
     catch(e){ stream.getTracks().forEach(t=>t.stop()); showErr("Partage annulé. Pour enregistrer vos interlocuteurs, choisissez l'onglet de la visio et cochez « Partager l'audio de l'onglet »."); return; }
     if(!disp.getAudioTracks().length){ disp.getTracks().forEach(t=>t.stop()); stream.getTracks().forEach(t=>t.stop()); disp=null;
@@ -453,6 +466,14 @@ $("wipe").onclick=async()=>{
   $("player").removeAttribute("src"); $("audioActions").hidden=true; $("source").hidden=true; $("go").disabled=true; setResume(0);
   $("status").textContent="Choisissez d'abord un audio."; notice("Tout a été effacé de cet appareil.");
 };
+function visioUI(){
+  $("visioOpts").hidden=!$("visio").checked;
+  $("visioHelp").textContent=$("hsYes").checked
+    ? "Au démarrage, choisissez l'onglet de la visio (Meet, Teams, Zoom dans le navigateur) et cochez « Partager l'audio de l'onglet ». Meilleure qualité."
+    : "Le micro enregistre tout ce qu'il entend, y compris vos interlocuteurs dans les haut-parleurs. Marche avec toutes les applications de visio ; gardez un volume suffisant.";
+  try{ localStorage.setItem("erdv-visio",JSON.stringify({on:$("visio").checked,hs:$("hsYes").checked?"yes":"no"})); }catch(e){}
+}
+["visio","hsYes","hsNo"].forEach(id=>$(id).addEventListener("change",visioUI));
 function showErr(m){ $("err").textContent=m; $("err").hidden=false; }
 window.addEventListener("beforeunload",e=>{ if(rec&&rec.state!=="inactive"){ e.preventDefault(); e.returnValue=""; } });
 
