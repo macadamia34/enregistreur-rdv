@@ -63,6 +63,14 @@ textarea{min-height:260px;resize:vertical;line-height:1.5}
 .note{background:var(--warn-soft);border-radius:8px;padding:10px 12px;font-size:.88rem}
 .note b{color:var(--warn)}
 .err{color:var(--rec);font-size:.9rem}
+.meters{display:grid;gap:6px}
+.meter{display:grid;grid-template-columns:7.5em 1fr;align-items:center;gap:8px;font-size:.82rem;color:var(--muted)}
+.lvl{height:8px;background:var(--line);border-radius:4px;overflow:hidden}
+.lvl i{display:block;height:100%;width:0;background:var(--accent);transition:width .15s}
+.prog{border:1px solid var(--line);border-radius:8px;padding:12px;display:flex;flex-direction:column;gap:8px}
+.progTop{display:flex;flex-wrap:wrap;align-items:baseline;gap:10px}
+.progTop strong{font-family:var(--mono);font-size:1.6rem;color:var(--accent)}
+.progTop #progClock{margin-left:auto}
 #visioOpts .seg{display:flex;gap:14px;flex-wrap:wrap}
 .info{background:var(--accent-soft);color:var(--accent);border-radius:8px;padding:10px 12px;font-size:.9rem;font-weight:500}
 #wipe{color:var(--rec)}
@@ -82,7 +90,11 @@ textarea{min-height:260px;resize:vertical;line-height:1.5}
       <div class="pane" id="recPane">
         <h3>Enregistrer maintenant</h3>
         <div class="timer num" id="timer"><span class="dot" hidden id="dot"></span>00:00:00</div>
-        <canvas id="meter" width="600" height="80" aria-hidden="true"></canvas>
+        <div class="meters">
+          <div class="meter"><span>Votre micro</span><div class="lvl"><i id="lvlMic"></i></div></div>
+          <div class="meter" id="farMeter" hidden><span>Interlocuteurs</span><div class="lvl"><i id="lvlFar"></i></div></div>
+        </div>
+        <label for="micSel" id="micRow" hidden>Micro utilisé<select id="micSel"></select></label>
         <div id="visioBox" hidden>
           <label class="inline"><input type="checkbox" id="visio"> Visio : enregistrer aussi mes interlocuteurs</label>
           <div id="visioOpts" hidden>
@@ -137,7 +149,11 @@ textarea{min-height:260px;resize:vertical;line-height:1.5}
       <button type="button" id="restart" hidden>Recommencer du début</button>
       <span class="small muted num" id="status">Choisissez d'abord un audio.</span>
     </div>
-    <div class="bar" id="barWrap" hidden><i id="bar"></i></div>
+    <div class="prog" id="prog" hidden>
+      <div class="progTop"><strong class="num" id="progPct">0 %</strong><span id="progPhase"></span><span class="muted small num" id="progClock"></span></div>
+      <div class="bar"><i id="bar"></i></div>
+      <span class="small muted num" id="progDetail"></span>
+    </div>
     <p class="small muted" id="help">Première utilisation : le modèle est téléchargé une fois (en wifi de préférence). La transcription est enregistrée au fur et à mesure : si la page se ferme, rouvrez-la et touchez « Reprendre ».</p>
     <div class="err" id="err" hidden></div>
     <textarea id="tx" placeholder="La transcription apparaîtra ici, au fur et à mesure. Vous pouvez la corriger."></textarea>
@@ -216,12 +232,28 @@ let disp=null, rec=null, recChunks=[], chunkWrites=[], stream=null, t0=0, elapse
 const fmt=s=>{s=Math.floor(s);return [s/3600|0,(s%3600)/60|0,s%60].map(n=>String(n).padStart(2,"0")).join(":")};
 const short=s=>fmt(s).replace(/^00:/,"");
 function showTime(){ const s=elapsed+(rec&&rec.state==="recording"?(performance.now()-t0)/1000:0); $("timer").lastChild.textContent=fmt(s); }
-function draw(){
-  const c=$("meter"),g=c.getContext("2d"),d=new Uint8Array(analyser.fftSize); analyser.getByteTimeDomainData(d);
-  g.clearRect(0,0,c.width,c.height); g.strokeStyle=getComputedStyle(document.documentElement).getPropertyValue("--rec"); g.lineWidth=2; g.beginPath();
-  for(let i=0;i<d.length;i++){ const x=i/d.length*c.width, y=d[i]/255*c.height; i?g.lineTo(x,y):g.moveTo(x,y); } g.stroke();
-  raf=requestAnimationFrame(draw);
+let anMic=null, anFar=null, quietMic=0, warned=false;
+const rms=an=>{ const d=new Float32Array(an.fftSize); an.getFloatTimeDomainData(d); let e=0; for(const v of d) e+=v*v; return Math.sqrt(e/d.length); };
+function levels(){
+  if(!anMic) return;
+  const m=rms(anMic), f=anFar?rms(anFar):0;
+  $("lvlMic").style.width=Math.min(100,Math.sqrt(m)*200)+"%"; if(anFar) $("lvlFar").style.width=Math.min(100,Math.sqrt(f)*200)+"%";
+  // micro muet alors que les interlocuteurs parlent : prévenir
+  if(rec&&rec.state==="recording"){ quietMic = m<0.003 ? quietMic+0.25 : 0;
+    if(quietMic>=12 && !warned){ warned=true; notice("Votre micro ne capte rien depuis 12 s. Vérifiez le « Micro utilisé » (le micro du casque ?) et qu'il n'est pas coupé."); } }
 }
+async function listMics(){
+  try{
+    const devs=(await navigator.mediaDevices.enumerateDevices()).filter(d=>d.kind==="audioinput");
+    if(!devs.length || !devs[0].label) return;
+    const sel=$("micSel"), keep=sel.value||(()=>{ try{ return localStorage.getItem("erdv-mic")||""; }catch(e){ return ""; } })();
+    sel.innerHTML=""; devs.forEach(d=>{ const o=document.createElement("option"); o.value=d.deviceId; o.textContent=d.label||"Micro"; sel.appendChild(o); });
+    if([...sel.options].some(o=>o.value===keep)) sel.value=keep;
+    $("micRow").hidden=devs.length<2;
+  }catch(e){}
+}
+$("micSel").addEventListener("change",()=>{ try{ localStorage.setItem("erdv-mic",$("micSel").value); }catch(e){} });
+listMics();
 function recName(ext){ const d=new Date(); return `rdv_${d.toISOString().slice(0,10)}_${String(d.getHours()).padStart(2,"0")}h${String(d.getMinutes()).padStart(2,"0")}.${ext}`; }
 $("recStart").onclick=async()=>{
   $("err").hidden=true; notice("");
@@ -229,7 +261,9 @@ $("recStart").onclick=async()=>{
   const visio=!MOBILE&&$("visio").checked, headset=$("hsYes").checked;
   // Sans casque : le micro capte aussi les haut-parleurs, donc on coupe le filtre d'écho pour garder la voix des interlocuteurs
   const roomMode=visio&&!headset;
-  try{ stream=await navigator.mediaDevices.getUserMedia({audio:roomMode?{echoCancellation:false,noiseSuppression:false,autoGainControl:true}:{echoCancellation:true,noiseSuppression:true,autoGainControl:true}}); }
+  const micId=$("micSel").value;
+  const cons=Object.assign(roomMode?{echoCancellation:false,noiseSuppression:false,autoGainControl:true}:{echoCancellation:true,noiseSuppression:true,autoGainControl:true}, micId?{deviceId:{ideal:micId}}:{});
+  try{ stream=await navigator.mediaDevices.getUserMedia({audio:cons}); listMics(); }
   catch(e){ showErr("Micro inaccessible. Autorisez le micro pour ce site (Réglages > Safari > Micro, ou l'icône « aA » dans la barre d'adresse), puis réessayez."); return; }
   recChunks=[]; chunkWrites=[]; elapsed=0;
   try{ await DB.clearChunks(); }catch(e){}
@@ -246,15 +280,19 @@ $("recStart").onclick=async()=>{
   }
   try{
     ac=new (window.AudioContext||window.webkitAudioContext)(); try{ await ac.resume(); }catch(e){}
-    analyser=ac.createAnalyser(); analyser.fftSize=1024;
-    const mic=ac.createMediaStreamSource(stream); mic.connect(analyser);
+    anMic=ac.createAnalyser(); anMic.fftSize=1024; anFar=null; quietMic=0; warned=false;
+    const mic=ac.createMediaStreamSource(stream); mic.connect(anMic);
+    $("farMeter").hidden=!disp;
     if(disp){
-      const dest=ac.createMediaStreamDestination(); mic.connect(dest);
-      const far=ac.createMediaStreamSource(new MediaStream(disp.getAudioTracks())); far.connect(dest); far.connect(analyser);
+      // mélange : votre voix un peu remontée, le son partagé un peu baissé, puis un compresseur pour éviter la saturation
+      const dest=ac.createMediaStreamDestination(), comp=ac.createDynamicsCompressor(), gMic=ac.createGain(), gFar=ac.createGain();
+      gMic.gain.value=1.5; gFar.gain.value=0.6; comp.threshold.value=-18; comp.ratio.value=4;
+      mic.connect(gMic).connect(comp); comp.connect(dest);
+      const far=ac.createMediaStreamSource(new MediaStream(disp.getAudioTracks()));
+      anFar=ac.createAnalyser(); anFar.fftSize=1024; far.connect(anFar); far.connect(gFar).connect(comp);
       disp.getAudioTracks()[0].addEventListener("ended",()=>notice("Le partage du son s'est arrêté : seul votre micro est encore enregistré."));
       recStream=dest.stream; notice("Visio : votre micro et le son partagé sont enregistrés.");
     }
-    draw();
   }catch(e){ if(disp){ disp.getTracks().forEach(t=>t.stop()); disp=null; stream.getTracks().forEach(t=>t.stop()); showErr("Impossible de mélanger les deux sons dans ce navigateur. Utilisez Chrome ou Edge."); return; } }
   rec=new MediaRecorder(recStream, mime?{mimeType:mime,audioBitsPerSecond:64000}:{});
   const ext=/mp4/.test(rec.mimeType||mime)?"m4a":/ogg/.test(rec.mimeType||mime)?"ogg":"webm";
@@ -264,7 +302,7 @@ $("recStart").onclick=async()=>{
     chunkWrites.push(e.data.arrayBuffer().then(buf=>DB.addChunk({buf,type:e.data.type||rec.mimeType})).catch(()=>{})); };
   rec.onstop=()=>onRecStop(name);
   rec.start(5000); t0=performance.now();
-  tick=setInterval(showTime,250); keepAwake(true);
+  tick=setInterval(()=>{ showTime(); levels(); },250); keepAwake(true);
   $("recPane").classList.add("rec"); $("dot").hidden=false;
   $("recStart").hidden=true; $("recPause").hidden=false; $("recStop").hidden=false; $("recPause").textContent="Pause";
 };
@@ -274,7 +312,7 @@ $("recPause").onclick=()=>{
 };
 $("recStop").onclick=()=>{ if(rec.state==="recording") elapsed+=(performance.now()-t0)/1000; rec.stop(); };
 async function onRecStop(name){
-  clearInterval(tick); cancelAnimationFrame(raf); stream.getTracks().forEach(t=>t.stop()); if(disp){ disp.getTracks().forEach(t=>t.stop()); disp=null; } try{ ac&&ac.close(); }catch(e){} keepAwake(false);
+  clearInterval(tick); anMic=anFar=null; $("lvlMic").style.width=$("lvlFar").style.width="0"; stream.getTracks().forEach(t=>t.stop()); if(disp){ disp.getTracks().forEach(t=>t.stop()); disp=null; } try{ ac&&ac.close(); }catch(e){} keepAwake(false);
   $("recPane").classList.remove("rec"); $("dot").hidden=true;
   $("recStart").hidden=false; $("recStart").textContent="Nouvel enregistrement"; $("recPause").hidden=true; $("recStop").hidden=true;
   const blob=new Blob(recChunks,{type:rec.mimeType||"audio/mp4"});
@@ -379,7 +417,8 @@ function ask(msg,transfer){
   return new Promise((res,rej)=>{
     const w=getWorker();
     const h=e=>{ const d=e.data;
-      if(d.type==="dl"){ $("bar").style.width=(d.loaded/d.total*100)+"%"; $("status").textContent=`Téléchargement du modèle (une seule fois) : ${(d.loaded/1048576).toFixed(0)} / ${(d.total/1048576).toFixed(0)} Mo`; return; }
+      if(d.type==="dl"){ const done=d.loaded>=d.total;
+        prog(done?2:1, done?null:d.loaded/d.total, done?"Préparation du modèle : jusqu'à une minute la première fois.":`Téléchargement du modèle (une seule fois) : ${(d.loaded/1048576).toFixed(0)} / ${(d.total/1048576).toFixed(0)} Mo`); return; }
       w.removeEventListener("message",h); w.removeEventListener("error",fail);
       d.type==="error"?rej(new Error(d.message)):res(d);
     };
@@ -396,6 +435,19 @@ function setResume(sec){
 }
 $("restart").onclick=()=>{ setResume(0); saveState({resumeAt:0}); $("status").textContent="La transcription repartira du début."; };
 
+/* ---------- avancement ---------- */
+let progT0=0, progTimer=null; const baseTitle=document.title;
+const PHASES={1:"Étape 1/3 · Téléchargement du modèle",2:"Étape 2/3 · Préparation du modèle",3:"Étape 3/3 · Transcription"};
+function prog(phase,frac,detail){
+  $("prog").hidden=false; $("progPhase").textContent=PHASES[phase];
+  if(frac!=null){ const p=Math.floor(frac*100); $("progPct").textContent=p+" %"; $("bar").style.width=p+"%"; document.title=`${p} % · ${phase===3?"Transcription":"Préparation"}`; }
+  else { $("progPct").textContent="…"; }
+  if(detail!=null) $("progDetail").textContent=detail;
+}
+function progStart(){ progT0=performance.now(); clearInterval(progTimer);
+  progTimer=setInterval(()=>{ $("progClock").textContent="écoulé "+short((performance.now()-progT0)/1000); },1000); $("progClock").textContent="écoulé 00:00"; }
+function progEnd(msg){ clearInterval(progTimer); document.title=baseTitle; if(msg){ $("progPhase").textContent=msg; } }
+
 $("go").onclick=async()=>{
   if(!audio||busy) return;
   busy=true; $("err").hidden=true; stopFlag=false; notice("");
@@ -404,15 +456,18 @@ $("go").onclick=async()=>{
     ? (choice==="turbo"?{encoder_model:"fp16",decoder_model_merged:"q4"}:{encoder_model:"fp32",decoder_model_merged:"q4"})
     : "q8";
   const startSample=Math.round(resumeFrom*SR);
-  $("go").disabled=true; $("restart").hidden=true; $("stop").hidden=false; $("barWrap").hidden=false; $("bar").style.width="0";
-  $("status").textContent="Chargement du modèle…"; keepAwake(true);
+  $("go").disabled=true; $("restart").hidden=true; $("stop").hidden=false; $("status").textContent="";
+  progStart(); prog(2,null,"Chargement du modèle…"); keepAwake(true);
   if(!startSample && $("tx").value.trim()){ $("tx").value+=`\n\n--- ${audioName} ---\n`; }
   let doneSec=resumeFrom;
   try{
     await ask({type:"load",model:MODELS[choice],device,dtype,key:choice+device});
     const segs=segments(audio).filter(sg=>sg.end>startSample), t1=performance.now(), from=segs.length?segs[0].start:0;
+    const total=fmt(audio.length/SR); let n=0, eta="estimation après le premier passage";
+    prog(3,startSample/audio.length,`${fmt(startSample/SR)} sur ${total} · ${eta}`);
     for(const sg of segs){
       if(stopFlag) break;
+      n++; $("progDetail").textContent=`${fmt(sg.start/SR)} sur ${total} · passage ${n}/${segs.length} en cours · ${eta}`;
       if(!sg.silent){
         const chunk=audio.slice(sg.start,sg.end);
         const r=await ask({type:"run",audio:chunk},[chunk.buffer]);
@@ -426,14 +481,14 @@ $("go").onclick=async()=>{
       doneSec=sg.end/SR;
       saveState({resumeAt: sg.end>=audio.length?0:doneSec});
       const el=(performance.now()-t1)/1000, rest=el/(sg.end-from)*(audio.length-sg.end);
-      $("bar").style.width=(sg.end/audio.length*100)+"%";
-      $("status").textContent=`Transcription : ${fmt(doneSec)} / ${fmt(audio.length/SR)} — reste environ ${Math.max(1,Math.round(rest/60))} min`;
+      eta = rest<60 ? "reste moins d'une minute" : `reste environ ${Math.round(rest/60)} min`;
+      prog(3,sg.end/audio.length,`${fmt(doneSec)} sur ${total} · ${eta}`);
     }
-    if(stopFlag){ setResume(doneSec); saveState({resumeAt:doneSec}); $("status").textContent=`Arrêté à ${fmt(doneSec)}.`; }
-    else { setResume(0); saveState({resumeAt:0}); $("status").textContent="Transcription terminée. Relisez-la, puis copiez-la vers Claude."; }
+    if(stopFlag){ setResume(doneSec); saveState({resumeAt:doneSec}); progEnd(`Arrêtée à ${fmt(doneSec)}`); }
+    else { setResume(0); saveState({resumeAt:0}); prog(3,1,"Relisez la transcription, puis copiez-la vers Claude."); progEnd("Transcription terminée"); }
   }catch(e){
     showErr("La transcription a échoué : "+e.message+(choice!=="base"?" — essayez le modèle « Rapide ».":""));
-    $("status").textContent=""; setResume(doneSec>0&&doneSec*SR<audio.length?doneSec:resumeFrom);
+    progEnd("Transcription interrompue"); setResume(doneSec>0&&doneSec*SR<audio.length?doneSec:resumeFrom);
     try{ worker&&worker.terminate(); }catch(_){} worker=null;
   }finally{
     busy=false; $("go").disabled=false; $("stop").hidden=true; keepAwake(false);
