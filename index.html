@@ -182,8 +182,10 @@ function notice(m){ $("notice").textContent=m; $("notice").hidden=!m; }
   if(!MOBILE){ try{ if(navigator.gpu){ const a=await navigator.gpu.requestAdapter(); if(a){ gpu.webgpu=true; gpu.f16=a.features.has("shader-f16"); } } }catch(e){} }
   const turbo=$("model").querySelector('[value="turbo"]');
   if(MOBILE){
-    $("device").textContent="Téléphone : mode allégé. « Rapide » est conseillé ; « Équilibré » est plus précis mais lent.";
-    $("model").value="base"; turbo.disabled=true; turbo.textContent="Précis (ordinateur uniquement)";
+    // Sur iPhone, Safari ferme la page au-delà du modèle « Rapide » (mémoire insuffisante)
+    const small=$("model").querySelector('[value="small"]');
+    $("device").textContent="Téléphone : seul le modèle « Rapide » tient dans la mémoire de Safari. Les autres sont réservés à l'ordinateur.";
+    $("model").value="base"; small.disabled=true; small.textContent="Équilibré (ordinateur uniquement)"; turbo.disabled=true; turbo.textContent="Précis (ordinateur uniquement)";
   }else{
     $("device").textContent = gpu.webgpu ? "Carte graphique détectée : transcription accélérée." : "Pas d'accélération graphique : la transcription sera plus lente.";
     if(!(gpu.webgpu&&gpu.f16)) turbo.disabled=true;
