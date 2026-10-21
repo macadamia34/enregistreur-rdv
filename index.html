@@ -82,6 +82,10 @@ textarea{min-height:260px;resize:vertical;line-height:1.5}
         <h3>Enregistrer maintenant</h3>
         <div class="timer num" id="timer"><span class="dot" hidden id="dot"></span>00:00:00</div>
         <canvas id="meter" width="600" height="80" aria-hidden="true"></canvas>
+        <div id="visioBox" hidden>
+          <label class="inline"><input type="checkbox" id="visio"> Visio : enregistrer aussi mes interlocuteurs</label>
+          <p class="small muted" style="margin:4px 0 0">Au démarrage, choisissez l'onglet de la visio (Meet, Teams, Zoom dans le navigateur) et cochez « Partager l'audio de l'onglet ». Un casque évite l'écho.</p>
+        </div>
         <div class="row">
           <button type="button" class="recbtn" id="recStart">Démarrer</button>
           <button type="button" id="recPause" hidden>Pause</button>
@@ -181,6 +185,7 @@ function notice(m){ $("notice").textContent=m; $("notice").hidden=!m; }
 (async()=>{
   if(!MOBILE){ try{ if(navigator.gpu){ const a=await navigator.gpu.requestAdapter(); if(a){ gpu.webgpu=true; gpu.f16=a.features.has("shader-f16"); } } }catch(e){} }
   const turbo=$("model").querySelector('[value="turbo"]');
+  if(!MOBILE && navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia) $("visioBox").hidden=false;
   if(MOBILE){
     // Sur iPhone, Safari ferme la page au-delà du modèle « Rapide » (mémoire insuffisante)
     const small=$("model").querySelector('[value="small"]');
@@ -198,7 +203,7 @@ async function keepAwake(on){
 document.addEventListener("visibilitychange",()=>{ if(document.visibilityState==="visible" && (busy||(rec&&rec.state==="recording"))) keepAwake(true); });
 
 /* ---------- enregistrement ---------- */
-let rec=null, recChunks=[], chunkWrites=[], stream=null, t0=0, elapsed=0, tick=null, ac=null, analyser=null, raf=null;
+let disp=null, rec=null, recChunks=[], chunkWrites=[], stream=null, t0=0, elapsed=0, tick=null, ac=null, analyser=null, raf=null;
 const fmt=s=>{s=Math.floor(s);return [s/3600|0,(s%3600)/60|0,s%60].map(n=>String(n).padStart(2,"0")).join(":")};
 const short=s=>fmt(s).replace(/^00:/,"");
 function showTime(){ const s=elapsed+(rec&&rec.state==="recording"?(performance.now()-t0)/1000:0); $("timer").lastChild.textContent=fmt(s); }
@@ -217,7 +222,28 @@ $("recStart").onclick=async()=>{
   recChunks=[]; chunkWrites=[]; elapsed=0;
   try{ await DB.clearChunks(); }catch(e){}
   const mime=["audio/mp4","audio/webm;codecs=opus","audio/ogg;codecs=opus"].find(m=>window.MediaRecorder&&MediaRecorder.isTypeSupported(m))||"";
-  rec=new MediaRecorder(stream, mime?{mimeType:mime,audioBitsPerSecond:48000}:{});
+  // Visio : capter aussi le son de l'onglet ou de l'ordinateur (les interlocuteurs)
+  let recStream=stream;
+  if(!MOBILE && $("visio").checked){
+    try{ disp=await navigator.mediaDevices.getDisplayMedia({video:true,audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false},systemAudio:"include",selfBrowserSurface:"exclude",surfaceSwitching:"include"}); }
+    catch(e){ stream.getTracks().forEach(t=>t.stop()); showErr("Partage annulé. Pour enregistrer vos interlocuteurs, choisissez l'onglet de la visio et cochez « Partager l'audio de l'onglet »."); return; }
+    if(!disp.getAudioTracks().length){ disp.getTracks().forEach(t=>t.stop()); stream.getTracks().forEach(t=>t.stop()); disp=null;
+      showErr("Aucun son partagé. Recommencez en cochant « Partager l'audio de l'onglet » (ou « du système ») dans la fenêtre de partage."); return; }
+    disp.getVideoTracks().forEach(t=>t.enabled=false);
+  }
+  try{
+    ac=new (window.AudioContext||window.webkitAudioContext)(); try{ await ac.resume(); }catch(e){}
+    analyser=ac.createAnalyser(); analyser.fftSize=1024;
+    const mic=ac.createMediaStreamSource(stream); mic.connect(analyser);
+    if(disp){
+      const dest=ac.createMediaStreamDestination(); mic.connect(dest);
+      const far=ac.createMediaStreamSource(new MediaStream(disp.getAudioTracks())); far.connect(dest); far.connect(analyser);
+      disp.getAudioTracks()[0].addEventListener("ended",()=>notice("Le partage du son s'est arrêté : seul votre micro est encore enregistré."));
+      recStream=dest.stream; notice("Visio : votre micro et le son partagé sont enregistrés.");
+    }
+    draw();
+  }catch(e){ if(disp){ disp.getTracks().forEach(t=>t.stop()); disp=null; stream.getTracks().forEach(t=>t.stop()); showErr("Impossible de mélanger les deux sons dans ce navigateur. Utilisez Chrome ou Edge."); return; } }
+  rec=new MediaRecorder(recStream, mime?{mimeType:mime,audioBitsPerSecond:64000}:{});
   const ext=/mp4/.test(rec.mimeType||mime)?"m4a":/ogg/.test(rec.mimeType||mime)?"ogg":"webm";
   const name=recName(ext); saveState({recName:name});
   rec.ondataavailable=e=>{ if(!e.data.size) return; recChunks.push(e.data);
@@ -225,7 +251,6 @@ $("recStart").onclick=async()=>{
     chunkWrites.push(e.data.arrayBuffer().then(buf=>DB.addChunk({buf,type:e.data.type||rec.mimeType})).catch(()=>{})); };
   rec.onstop=()=>onRecStop(name);
   rec.start(5000); t0=performance.now();
-  try{ ac=new (window.AudioContext||window.webkitAudioContext)(); analyser=ac.createAnalyser(); analyser.fftSize=1024; ac.createMediaStreamSource(stream).connect(analyser); draw(); }catch(e){}
   tick=setInterval(showTime,250); keepAwake(true);
   $("recPane").classList.add("rec"); $("dot").hidden=false;
   $("recStart").hidden=true; $("recPause").hidden=false; $("recStop").hidden=false; $("recPause").textContent="Pause";
@@ -236,7 +261,7 @@ $("recPause").onclick=()=>{
 };
 $("recStop").onclick=()=>{ if(rec.state==="recording") elapsed+=(performance.now()-t0)/1000; rec.stop(); };
 async function onRecStop(name){
-  clearInterval(tick); cancelAnimationFrame(raf); stream.getTracks().forEach(t=>t.stop()); try{ ac&&ac.close(); }catch(e){} keepAwake(false);
+  clearInterval(tick); cancelAnimationFrame(raf); stream.getTracks().forEach(t=>t.stop()); if(disp){ disp.getTracks().forEach(t=>t.stop()); disp=null; } try{ ac&&ac.close(); }catch(e){} keepAwake(false);
   $("recPane").classList.remove("rec"); $("dot").hidden=true;
   $("recStart").hidden=false; $("recStart").textContent="Nouvel enregistrement"; $("recPause").hidden=true; $("recStop").hidden=true;
   const blob=new Blob(recChunks,{type:rec.mimeType||"audio/mp4"});
