@@ -63,6 +63,8 @@ textarea{min-height:260px;resize:vertical;line-height:1.5}
 .note{background:var(--warn-soft);border-radius:8px;padding:10px 12px;font-size:.88rem}
 .note b{color:var(--warn)}
 .err{color:var(--rec);font-size:.9rem}
+.info{background:var(--accent-soft);color:var(--accent);border-radius:8px;padding:10px 12px;font-size:.9rem;font-weight:500}
+#wipe{color:var(--rec)}
 .num{font-variant-numeric:tabular-nums}
 </style>
 </head>
@@ -70,7 +72,7 @@ textarea{min-height:260px;resize:vertical;line-height:1.5}
 <div class="wrap">
   <header>
     <h1>Enregistreur RDV client</h1>
-    <p>Enregistrez l'entretien ou déposez un fichier audio. La transcription se fait sur cet ordinateur : aucun son ne sort de la machine.</p>
+    <p>Enregistrez l'entretien ou déposez un fichier audio. La transcription se fait sur votre appareil : aucun son n'est envoyé.</p>
   </header>
 
   <section>
@@ -94,12 +96,13 @@ textarea{min-height:260px;resize:vertical;line-height:1.5}
         </label>
       </div>
     </div>
+    <div class="info" id="notice" hidden></div>
     <div class="source" id="source" hidden></div>
     <div class="row" id="audioActions" hidden>
       <audio id="player" controls style="width:100%;max-width:100%"></audio>
       <a class="btn" id="saveAudio" download hidden>Sauvegarder l'enregistrement</a>
     </div>
-    <p class="note"><b>Avant d'enregistrer</b> : informez le client et recueillez son accord en début d'entretien. Pensez à sauvegarder l'enregistrement : il disparaît à la fermeture de la page.</p>
+    <p class="note"><b>Avant d'enregistrer</b> : informez le client et recueillez son accord. Pendant l'enregistrement, gardez la page ouverte au premier plan (ne changez pas d'application). L'audio est gardé sur ce téléphone, même si la page se ferme, jusqu'à ce que vous l'effaciez.</p>
   </section>
 
   <section>
@@ -107,8 +110,8 @@ textarea{min-height:260px;resize:vertical;line-height:1.5}
     <div class="cols">
       <label for="model">Modèle
         <select id="model">
-          <option value="base">Rapide (moins précis)</option>
-          <option value="small" selected>Équilibré (recommandé)</option>
+          <option value="base">Rapide</option>
+          <option value="small" selected>Équilibré</option>
           <option value="turbo">Précis (carte graphique récente)</option>
         </select>
       </label>
@@ -120,10 +123,11 @@ textarea{min-height:260px;resize:vertical;line-height:1.5}
     <div class="row">
       <button type="button" class="primary" id="go" disabled>Transcrire</button>
       <button type="button" id="stop" hidden>Arrêter</button>
+      <button type="button" id="restart" hidden>Recommencer du début</button>
       <span class="small muted num" id="status">Choisissez d'abord un audio.</span>
     </div>
     <div class="bar" id="barWrap" hidden><i id="bar"></i></div>
-    <p class="small muted">Première utilisation : le modèle est téléchargé une fois (150 Mo à 1,5 Go selon le choix). Comptez ensuite environ 5 à 15 min de calcul pour 1 h d'entretien avec une carte graphique, nettement plus sans.</p>
+    <p class="small muted" id="help">Première utilisation : le modèle est téléchargé une fois (en wifi de préférence). La transcription est enregistrée au fur et à mesure : si la page se ferme, rouvrez-la et touchez « Reprendre ».</p>
     <div class="err" id="err" hidden></div>
     <textarea id="tx" placeholder="La transcription apparaîtra ici, au fur et à mesure. Vous pouvez la corriger."></textarea>
   </section>
@@ -140,6 +144,7 @@ textarea{min-height:260px;resize:vertical;line-height:1.5}
       <button type="button" id="dlTxt">Télécharger .txt</button>
       <span class="small muted" id="copyStatus"></span>
     </div>
+    <div class="row"><button type="button" id="wipe">Effacer l'audio et la transcription de cet appareil</button></div>
     <p class="small muted">Collez la transcription dans Récap RDV client, puis choisissez « Email au client » ou « Note de dossier ».</p>
   </section>
 </div>
@@ -147,28 +152,53 @@ textarea{min-height:260px;resize:vertical;line-height:1.5}
 <script>
 const $=id=>document.getElementById(id);
 const TF="https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1/dist/transformers.min.js";
-const MODELS={
-  base:{id:"onnx-community/whisper-base"},
-  small:{id:"onnx-community/whisper-small"},
-  turbo:{id:"onnx-community/whisper-large-v3-turbo"}
-};
+const MODELS={ base:"onnx-community/whisper-base", small:"onnx-community/whisper-small", turbo:"onnx-community/whisper-large-v3-turbo" };
 const SR=16000;
-let audio=null, audioName="", worker=null, stopFlag=false, gpu={webgpu:false,f16:false}, dirty=false, wakeLock=null;
+const MOBILE=/iPhone|iPad|iPod|Android/i.test(navigator.userAgent)||(navigator.platform==="MacIntel"&&navigator.maxTouchPoints>1);
+let audio=null, audioName="", worker=null, stopFlag=false, gpu={webgpu:false,f16:false}, wakeLock=null, resumeFrom=0, busy=false;
+
+/* ---------- stockage local (cet appareil uniquement) ---------- */
+const DB=(()=>{
+  let p;
+  const open=()=>p??=new Promise((res,rej)=>{ const r=indexedDB.open("erdv",1);
+    r.onupgradeneeded=()=>{ const d=r.result; d.createObjectStore("kv"); d.createObjectStore("chunks",{autoIncrement:true}); };
+    r.onsuccess=()=>res(r.result); r.onerror=()=>rej(r.error); });
+  const run=async(store,mode,fn)=>{ const d=await open(); return new Promise((res,rej)=>{ const t=d.transaction(store,mode); const q=fn(t.objectStore(store));
+    t.oncomplete=()=>res(q&&q.result); t.onerror=()=>rej(t.error); t.onabort=()=>rej(t.error); }); };
+  return {
+    get:k=>run("kv","readonly",s=>s.get(k)), set:(k,v)=>run("kv","readwrite",s=>s.put(v,k)),
+    addChunk:v=>run("chunks","readwrite",s=>s.add(v)), chunks:()=>run("chunks","readonly",s=>s.getAll()),
+    clearChunks:()=>run("chunks","readwrite",s=>s.clear()),
+    wipe:async()=>{ await run("kv","readwrite",s=>s.clear()); await run("chunks","readwrite",s=>s.clear()); }
+  };
+})();
+const LS="erdv-state";
+function loadState(){ try{ return JSON.parse(localStorage.getItem(LS)||"{}"); }catch(e){ return {}; } }
+function saveState(extra){ try{ localStorage.setItem(LS, JSON.stringify(Object.assign(loadState(),{tx:$("tx").value,client:$("client").value,date:$("date").value},extra||{}))); }catch(e){} }
+function notice(m){ $("notice").textContent=m; $("notice").hidden=!m; }
 
 /* ---------- matériel ---------- */
 (async()=>{
-  try{ if(navigator.gpu){ const a=await navigator.gpu.requestAdapter(); if(a){ gpu.webgpu=true; gpu.f16=a.features.has("shader-f16"); } } }catch(e){}
-  $("device").textContent = gpu.webgpu ? "Carte graphique détectée : transcription accélérée." : "Pas d'accélération graphique : la transcription sera plus lente.";
-  if(!(gpu.webgpu&&gpu.f16)){ $("model").querySelector('[value="turbo"]').disabled=true; }
+  if(!MOBILE){ try{ if(navigator.gpu){ const a=await navigator.gpu.requestAdapter(); if(a){ gpu.webgpu=true; gpu.f16=a.features.has("shader-f16"); } } }catch(e){} }
+  const turbo=$("model").querySelector('[value="turbo"]');
+  if(MOBILE){
+    $("device").textContent="Téléphone : mode allégé. « Rapide » est conseillé ; « Équilibré » est plus précis mais lent.";
+    $("model").value="base"; turbo.disabled=true; turbo.textContent="Précis (ordinateur uniquement)";
+  }else{
+    $("device").textContent = gpu.webgpu ? "Carte graphique détectée : transcription accélérée." : "Pas d'accélération graphique : la transcription sera plus lente.";
+    if(!(gpu.webgpu&&gpu.f16)) turbo.disabled=true;
+  }
 })();
 async function keepAwake(on){
-  try{ if(on && !wakeLock && navigator.wakeLock){ wakeLock=await navigator.wakeLock.request("screen"); }
+  try{ if(on && !wakeLock && navigator.wakeLock){ wakeLock=await navigator.wakeLock.request("screen"); wakeLock.addEventListener("release",()=>wakeLock=null); }
        if(!on && wakeLock){ await wakeLock.release(); wakeLock=null; } }catch(e){}
 }
+document.addEventListener("visibilitychange",()=>{ if(document.visibilityState==="visible" && (busy||(rec&&rec.state==="recording"))) keepAwake(true); });
 
 /* ---------- enregistrement ---------- */
-let rec=null, recChunks=[], stream=null, t0=0, elapsed=0, tick=null, ac=null, analyser=null, raf=null;
+let rec=null, recChunks=[], chunkWrites=[], stream=null, t0=0, elapsed=0, tick=null, ac=null, analyser=null, raf=null;
 const fmt=s=>{s=Math.floor(s);return [s/3600|0,(s%3600)/60|0,s%60].map(n=>String(n).padStart(2,"0")).join(":")};
+const short=s=>fmt(s).replace(/^00:/,"");
 function showTime(){ const s=elapsed+(rec&&rec.state==="recording"?(performance.now()-t0)/1000:0); $("timer").lastChild.textContent=fmt(s); }
 function draw(){
   const c=$("meter"),g=c.getContext("2d"),d=new Uint8Array(analyser.fftSize); analyser.getByteTimeDomainData(d);
@@ -176,18 +206,25 @@ function draw(){
   for(let i=0;i<d.length;i++){ const x=i/d.length*c.width, y=d[i]/255*c.height; i?g.lineTo(x,y):g.moveTo(x,y); } g.stroke();
   raf=requestAnimationFrame(draw);
 }
+function recName(ext){ const d=new Date(); return `rdv_${d.toISOString().slice(0,10)}_${String(d.getHours()).padStart(2,"0")}h${String(d.getMinutes()).padStart(2,"0")}.${ext}`; }
 $("recStart").onclick=async()=>{
-  $("err").hidden=true;
+  $("err").hidden=true; notice("");
+  if(busy){ showErr("Attendez la fin de la transcription en cours avant d'enregistrer."); return; }
   try{ stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true}}); }
-  catch(e){ showErr("Micro inaccessible. Autorisez le micro pour cette page dans le navigateur (icône à gauche de la barre d'adresse), puis réessayez."); return; }
-  recChunks=[]; elapsed=0;
-  const mime=["audio/webm;codecs=opus","audio/mp4","audio/ogg;codecs=opus"].find(m=>window.MediaRecorder&&MediaRecorder.isTypeSupported(m))||"";
+  catch(e){ showErr("Micro inaccessible. Autorisez le micro pour ce site (Réglages > Safari > Micro, ou l'icône « aA » dans la barre d'adresse), puis réessayez."); return; }
+  recChunks=[]; chunkWrites=[]; elapsed=0;
+  try{ await DB.clearChunks(); }catch(e){}
+  const mime=["audio/mp4","audio/webm;codecs=opus","audio/ogg;codecs=opus"].find(m=>window.MediaRecorder&&MediaRecorder.isTypeSupported(m))||"";
   rec=new MediaRecorder(stream, mime?{mimeType:mime,audioBitsPerSecond:48000}:{});
-  rec.ondataavailable=e=>{ if(e.data.size) recChunks.push(e.data); };
-  rec.onstop=onRecStop;
+  const ext=/mp4/.test(rec.mimeType||mime)?"m4a":/ogg/.test(rec.mimeType||mime)?"ogg":"webm";
+  const name=recName(ext); saveState({recName:name});
+  rec.ondataavailable=e=>{ if(!e.data.size) return; recChunks.push(e.data);
+    // chaque morceau est gardé sur l'appareil : rien n'est perdu si la page se ferme
+    chunkWrites.push(e.data.arrayBuffer().then(buf=>DB.addChunk({buf,type:e.data.type||rec.mimeType})).catch(()=>{})); };
+  rec.onstop=()=>onRecStop(name);
   rec.start(5000); t0=performance.now();
-  ac=new AudioContext(); analyser=ac.createAnalyser(); analyser.fftSize=1024; ac.createMediaStreamSource(stream).connect(analyser); draw();
-  tick=setInterval(showTime,250); keepAwake(true); dirty=true;
+  try{ ac=new (window.AudioContext||window.webkitAudioContext)(); analyser=ac.createAnalyser(); analyser.fftSize=1024; ac.createMediaStreamSource(stream).connect(analyser); draw(); }catch(e){}
+  tick=setInterval(showTime,250); keepAwake(true);
   $("recPane").classList.add("rec"); $("dot").hidden=false;
   $("recStart").hidden=true; $("recPause").hidden=false; $("recStop").hidden=false; $("recPause").textContent="Pause";
 };
@@ -196,38 +233,52 @@ $("recPause").onclick=()=>{
   else { rec.resume(); t0=performance.now(); $("recPause").textContent="Pause"; $("recPane").classList.add("rec"); }
 };
 $("recStop").onclick=()=>{ if(rec.state==="recording") elapsed+=(performance.now()-t0)/1000; rec.stop(); };
-async function onRecStop(){
-  clearInterval(tick); cancelAnimationFrame(raf); stream.getTracks().forEach(t=>t.stop()); ac&&ac.close(); keepAwake(false);
+async function onRecStop(name){
+  clearInterval(tick); cancelAnimationFrame(raf); stream.getTracks().forEach(t=>t.stop()); try{ ac&&ac.close(); }catch(e){} keepAwake(false);
   $("recPane").classList.remove("rec"); $("dot").hidden=true;
   $("recStart").hidden=false; $("recStart").textContent="Nouvel enregistrement"; $("recPause").hidden=true; $("recStop").hidden=true;
-  const blob=new Blob(recChunks,{type:rec.mimeType||"audio/webm"});
-  const ext=/mp4/.test(blob.type)?"m4a":/ogg/.test(blob.type)?"ogg":"webm";
-  const d=new Date(), name=`rdv_${d.toISOString().slice(0,10)}_${String(d.getHours()).padStart(2,"0")}h${String(d.getMinutes()).padStart(2,"0")}.${ext}`;
-  await loadAudio(blob, name, true);
+  const blob=new Blob(recChunks,{type:rec.mimeType||"audio/mp4"});
+  await Promise.all(chunkWrites);
+  await loadAudio(blob, name, true, true);
+  try{ await DB.clearChunks(); }catch(e){}
 }
 
 /* ---------- fichier ---------- */
 const drop=$("drop");
 ["dragenter","dragover"].forEach(ev=>drop.addEventListener(ev,e=>{e.preventDefault();drop.classList.add("over")}));
 ["dragleave","drop"].forEach(ev=>drop.addEventListener(ev,()=>drop.classList.remove("over")));
-drop.addEventListener("drop",e=>{e.preventDefault(); const f=e.dataTransfer.files[0]; if(f) loadAudio(f,f.name,false);});
-$("file").onchange=e=>{ const f=e.target.files[0]; if(f) loadAudio(f,f.name,false); e.target.value=""; };
+drop.addEventListener("drop",e=>{e.preventDefault(); const f=e.dataTransfer.files[0]; if(f) pickFile(f);});
+$("file").onchange=e=>{ const f=e.target.files[0]; if(f) pickFile(f); e.target.value=""; };
+function pickFile(f){ if(busy){ showErr("Attendez la fin de la transcription en cours."); return; } notice(""); loadAudio(f,f.name,false,true); }
 
-async function loadAudio(blob,name,isRec){
+async function loadAudio(blob,name,isRec,persist){
   $("err").hidden=true; $("go").disabled=true; $("status").textContent="Lecture de l'audio…";
+  audio=null;
   const url=URL.createObjectURL(blob); $("player").src=url; $("audioActions").hidden=false;
   $("saveAudio").hidden=!isRec; if(isRec){ $("saveAudio").href=url; $("saveAudio").download=name; }
   try{
     const buf=await blob.arrayBuffer();
+    if(persist){ try{ await DB.set("current",{buf:buf.slice(0),type:blob.type,name,isRec}); }catch(e){} saveState({resumeAt:0,audioName:name}); setResume(0); }
     const ctx=new (window.AudioContext||window.webkitAudioContext)({sampleRate:SR});
-    const ab=await ctx.decodeAudioData(buf); ctx.close();
-    const n=ab.length, out=new Float32Array(n), ch=ab.numberOfChannels;
-    for(let c=0;c<ch;c++){ const d=ab.getChannelData(c); for(let i=0;i<n;i++) out[i]+=d[i]/ch; }
+    let ab=await ctx.decodeAudioData(buf); try{ ctx.close(); }catch(e){}
+    let out;
+    if(ab.sampleRate!==SR){
+      // le navigateur n'a pas décodé en 16 kHz : conversion en mono 16 kHz
+      const off=new OfflineAudioContext(1, Math.ceil(ab.duration*SR), SR);
+      const src=off.createBufferSource(); src.buffer=ab; src.connect(off.destination); src.start();
+      ab=await off.startRendering(); out=ab.getChannelData(0);
+    }else{
+      // mono, sans copie supplémentaire (économise la mémoire du téléphone)
+      const ch=ab.numberOfChannels; out=ab.getChannelData(0);
+      if(ch>1){ for(let c=1;c<ch;c++){ const d=ab.getChannelData(c); for(let i=0;i<out.length;i++) out[i]+=d[i]; } for(let i=0;i<out.length;i++) out[i]/=ch; }
+    }
     audio=out; audioName=name;
-    $("source").hidden=false; $("source").textContent=`${isRec?"Enregistrement":"Fichier"} : ${name} — durée ${fmt(n/SR)}`;
-    $("go").disabled=false; $("status").textContent="Prêt à transcrire.";
+    $("source").hidden=false; $("source").textContent=`${isRec?"Enregistrement":"Fichier"} : ${name} — durée ${fmt(out.length/SR)}`;
+    $("go").disabled=false; if(!resumeFrom) $("status").textContent="Prêt à transcrire.";
+    return true;
   }catch(e){
-    audio=null; $("status").textContent=""; showErr("Ce fichier audio n'a pas pu être lu par le navigateur. Essayez un mp3, m4a ou wav, ou utilisez Chrome.");
+    $("status").textContent=""; showErr("Ce fichier audio n'a pas pu être lu. Essayez un mp3, m4a ou wav.");
+    return false;
   }
 }
 
@@ -237,18 +288,17 @@ function segments(a){
   let s=0;
   while(s<a.length){
     let e=Math.min(s+max,a.length);
-    if(e<a.length){ // chercher le passage le plus calme dans les 4 dernières secondes
+    if(e<a.length){
       let best=e, bestE=Infinity;
       for(let p=e-look;p<e;p+=win){ let en=0; for(let i=p;i<p+win;i++) en+=a[i]*a[i]; if(en<bestE){bestE=en;best=p+(win>>1);} }
       e=best;
     }
-    let en=0; for(let i=s;i<e;i+=4) en+=a[i]*a[i]; const rms=Math.sqrt(en/((e-s)/4));
+    let en=0; for(let i=s;i<e;i+=4) en+=a[i]*a[i]; const rms=Math.sqrt(en/Math.max(1,(e-s)/4));
     segs.push({start:s,end:e,silent:rms<0.004});
     s=e;
   }
   return segs;
 }
-// Phrases que Whisper invente sur les silences
 const HALLU=/^(sous-titr(age|es)|merci d'avoir regardé|abonnez-vous|n'hésitez pas à vous abonner|♪|\.\.\.|merci\.?)$/i;
 function clean(t){ t=t.trim(); return t.split(/(?<=[.!?])\s+/).filter(x=>!/sous-titrage|amara\.org|radio-canada/i.test(x)).join(" ").trim(); }
 
@@ -256,14 +306,16 @@ function clean(t){ t=t.trim(); return t.split(/(?<=[.!?])\s+/).filter(x=>!/sous-
 const workerSrc=`
 import { pipeline, env } from "${TF}";
 env.allowLocalModels=false;
-env.useBrowserCache = (typeof caches!=="undefined");
+env.useBrowserCache=(typeof caches!=="undefined");
+try{ env.backends.onnx.wasm.numThreads=1; }catch(e){}
 let asr=null, key=null;
 self.onmessage=async(e)=>{
   const m=e.data;
   try{
     if(m.type==="load"){
       if(key!==m.key){
-        asr=null;
+        if(asr&&asr.dispose){ try{ await asr.dispose(); }catch(_){} }
+        asr=null; key=null;
         const files={};
         asr=await pipeline("automatic-speech-recognition", m.model, {
           device:m.device, dtype:m.dtype,
@@ -275,7 +327,7 @@ self.onmessage=async(e)=>{
     }
     if(m.type==="run"){
       const r=await asr(m.audio,{language:"french",task:"transcribe"});
-      self.postMessage({type:"text",i:m.i,text:r.text||""});
+      self.postMessage({type:"text",text:r.text||""});
     }
   }catch(err){ self.postMessage({type:"error",message:String(err&&err.message||err)}); }
 };`;
@@ -287,62 +339,69 @@ function ask(msg,transfer){
   return new Promise((res,rej)=>{
     const w=getWorker();
     const h=e=>{ const d=e.data;
-      if(d.type==="dl"){ const pct=d.loaded/d.total*100; $("bar").style.width=pct+"%"; $("status").textContent=`Téléchargement du modèle (première fois) : ${(d.loaded/1048576).toFixed(0)} / ${(d.total/1048576).toFixed(0)} Mo`; return; }
+      if(d.type==="dl"){ $("bar").style.width=(d.loaded/d.total*100)+"%"; $("status").textContent=`Téléchargement du modèle (une seule fois) : ${(d.loaded/1048576).toFixed(0)} / ${(d.total/1048576).toFixed(0)} Mo`; return; }
       w.removeEventListener("message",h); w.removeEventListener("error",fail);
       d.type==="error"?rej(new Error(d.message)):res(d);
     };
-    // Si le moteur ne se charge pas (réseau, navigateur), le signaler au lieu de rester bloqué
     const fail=ev=>{ ev.preventDefault&&ev.preventDefault(); w.removeEventListener("message",h); w.removeEventListener("error",fail);
-      worker=null; rej(new Error("le moteur de transcription n'a pas pu démarrer dans ce navigateur"+(ev.message?" ("+ev.message+")":""))); };
+      try{ w.terminate(); }catch(_){} worker=null; rej(new Error("le moteur de transcription n'a pas pu démarrer"+(ev.message?" ("+ev.message+")":""))); };
     w.addEventListener("message",h); w.addEventListener("error",fail); w.postMessage(msg,transfer||[]);
   });
 }
 
+function setResume(sec){
+  resumeFrom=sec>0?sec:0;
+  $("go").textContent=resumeFrom?`Reprendre à ${short(resumeFrom)}`:"Transcrire";
+  $("restart").hidden=!resumeFrom;
+}
+$("restart").onclick=()=>{ setResume(0); saveState({resumeAt:0}); $("status").textContent="La transcription repartira du début."; };
+
 $("go").onclick=async()=>{
-  if(!audio) return;
-  $("err").hidden=true; stopFlag=false; dirty=true;
-  const choice=$("model").value, device=gpu.webgpu?"webgpu":"wasm";
+  if(!audio||busy) return;
+  busy=true; $("err").hidden=true; stopFlag=false; notice("");
+  const choice=$("model").value, device=(!MOBILE&&gpu.webgpu)?"webgpu":"wasm";
   const dtype = device==="webgpu"
     ? (choice==="turbo"?{encoder_model:"fp16",decoder_model_merged:"q4"}:{encoder_model:"fp32",decoder_model_merged:"q4"})
     : "q8";
-  $("go").disabled=true; $("stop").hidden=false; $("barWrap").hidden=false; $("bar").style.width="0";
+  const startSample=Math.round(resumeFrom*SR);
+  $("go").disabled=true; $("restart").hidden=true; $("stop").hidden=false; $("barWrap").hidden=false; $("bar").style.width="0";
   $("status").textContent="Chargement du modèle…"; keepAwake(true);
-  if($("tx").value.trim()){ $("tx").value+="\n\n"; }
-  const prefixLen=$("tx").value.length;
+  if(!startSample && $("tx").value.trim()){ $("tx").value+=`\n\n--- ${audioName} ---\n`; }
+  let doneSec=resumeFrom;
   try{
-    await ask({type:"load",model:MODELS[choice].id,device,dtype,key:choice+device});
-    const segs=segments(audio), t1=performance.now(); let doneSec=0;
-    for(let i=0;i<segs.length;i++){
+    await ask({type:"load",model:MODELS[choice],device,dtype,key:choice+device});
+    const segs=segments(audio).filter(sg=>sg.end>startSample), t1=performance.now(), from=segs.length?segs[0].start:0;
+    for(const sg of segs){
       if(stopFlag) break;
-      const sg=segs[i];
       if(!sg.silent){
         const chunk=audio.slice(sg.start,sg.end);
-        const r=await ask({type:"run",i,audio:chunk},[chunk.buffer]);
+        const r=await ask({type:"run",audio:chunk},[chunk.buffer]);
         const t=clean(r.text);
         if(t && !HALLU.test(t)){
-          const line=($("stamps").checked?`[${fmt(sg.start/SR).replace(/^00:/,"")}] `:"")+t;
-          $("tx").value+=( $("tx").value.length>prefixLen ? "\n" : "" )+line;
+          const v=$("tx").value;
+          $("tx").value=v+(v&&!v.endsWith("\n")?"\n":"")+($("stamps").checked?`[${short(sg.start/SR)}] `:"")+t;
           $("tx").scrollTop=$("tx").scrollHeight;
         }
       }
       doneSec=sg.end/SR;
-      const pct=sg.end/audio.length*100, el=(performance.now()-t1)/1000, rest=el/sg.end*(audio.length-sg.end);
-      $("bar").style.width=pct+"%";
+      saveState({resumeAt: sg.end>=audio.length?0:doneSec});
+      const el=(performance.now()-t1)/1000, rest=el/(sg.end-from)*(audio.length-sg.end);
+      $("bar").style.width=(sg.end/audio.length*100)+"%";
       $("status").textContent=`Transcription : ${fmt(doneSec)} / ${fmt(audio.length/SR)} — reste environ ${Math.max(1,Math.round(rest/60))} min`;
     }
-    $("status").textContent= stopFlag ? `Arrêté à ${fmt(doneSec)}.` : "Transcription terminée. Relisez-la, puis copiez-la vers Claude.";
+    if(stopFlag){ setResume(doneSec); saveState({resumeAt:doneSec}); $("status").textContent=`Arrêté à ${fmt(doneSec)}.`; }
+    else { setResume(0); saveState({resumeAt:0}); $("status").textContent="Transcription terminée. Relisez-la, puis copiez-la vers Claude."; }
   }catch(e){
     showErr("La transcription a échoué : "+e.message+(choice!=="base"?" — essayez le modèle « Rapide ».":""));
-    $("status").textContent="";
-    worker&&worker.terminate(); worker=null;
+    $("status").textContent=""; setResume(doneSec>0&&doneSec*SR<audio.length?doneSec:resumeFrom);
+    try{ worker&&worker.terminate(); }catch(_){} worker=null;
   }finally{
-    $("go").disabled=false; $("stop").hidden=true; keepAwake(false);
+    busy=false; $("go").disabled=false; $("stop").hidden=true; keepAwake(false);
   }
 };
-$("stop").onclick=()=>{ stopFlag=true; $("status").textContent="Arrêt après le segment en cours…"; };
+$("stop").onclick=()=>{ stopFlag=true; $("status").textContent="Arrêt après le passage en cours…"; };
 
 /* ---------- vers Claude ---------- */
-$("date").value=new Date().toISOString().slice(0,10);
 function exportText(){
   const d=$("date").value?new Date($("date").value+"T12:00").toLocaleDateString("fr-FR",{day:"numeric",month:"long",year:"numeric"}):"";
   const head=[$("client").value&&"Client : "+$("client").value, d&&"Date du rendez-vous : "+d].filter(Boolean).join("\n");
@@ -351,16 +410,46 @@ function exportText(){
 $("copy").onclick=async()=>{
   const t=exportText(); if(!$("tx").value.trim()){ $("copyStatus").textContent="Rien à copier pour l'instant."; return; }
   try{ await navigator.clipboard.writeText(t); $("copyStatus").textContent="Copié. Collez-le dans Récap RDV client."; }
-  catch(e){ $("tx").select(); $("copyStatus").textContent="Copie automatique refusée : le texte est sélectionné, faites Ctrl+C."; }
+  catch(e){ $("tx").focus(); $("tx").select(); $("copyStatus").textContent="Copie automatique refusée : le texte est sélectionné, copiez-le."; }
 };
 $("dlTxt").onclick=()=>{
   const c=($("client").value||"rdv").normalize("NFD").replace(/[̀-ͯ]/g,"").replace(/[^\w]+/g,"-").replace(/^-|-$/g,"")||"rdv";
   const a=document.createElement("a"); a.href=URL.createObjectURL(new Blob([exportText()],{type:"text/plain;charset=utf-8"}));
   a.download=`${$("date").value}_transcription_${c}.txt`; a.click();
 };
-$("tx").addEventListener("input",()=>dirty=true);
+["tx","client","date"].forEach(id=>$(id).addEventListener("input",()=>saveState()));
+$("wipe").onclick=async()=>{
+  if(busy||(rec&&rec.state!=="inactive")){ showErr("Arrêtez d'abord l'enregistrement ou la transcription."); return; }
+  if(!confirm("Effacer de cet appareil l'audio, la transcription et les infos du rendez-vous ?")) return;
+  try{ await DB.wipe(); }catch(e){} try{ localStorage.removeItem(LS); }catch(e){}
+  audio=null; $("tx").value=""; $("client").value=""; $("date").value=new Date().toISOString().slice(0,10);
+  $("player").removeAttribute("src"); $("audioActions").hidden=true; $("source").hidden=true; $("go").disabled=true; setResume(0);
+  $("status").textContent="Choisissez d'abord un audio."; notice("Tout a été effacé de cet appareil.");
+};
 function showErr(m){ $("err").textContent=m; $("err").hidden=false; }
-window.addEventListener("beforeunload",e=>{ if(dirty||(rec&&rec.state!=="inactive")){ e.preventDefault(); e.returnValue=""; } });
+window.addEventListener("beforeunload",e=>{ if(rec&&rec.state!=="inactive"){ e.preventDefault(); e.returnValue=""; } });
+
+/* ---------- reprise après fermeture de la page ---------- */
+(async()=>{
+  const st=loadState();
+  $("date").value=st.date||new Date().toISOString().slice(0,10);
+  if(st.tx) $("tx").value=st.tx; if(st.client) $("client").value=st.client;
+  try{
+    const ch=await DB.chunks();
+    if(ch&&ch.length){
+      const blob=new Blob(ch.map(c=>c.buf),{type:ch[0].type||"audio/mp4"});
+      if(await loadAudio(blob, st.recName||recName("m4a"), true, true)){ await DB.clearChunks(); notice("Un enregistrement interrompu a été récupéré. Vous pouvez le transcrire."); }
+      return;
+    }
+    const cur=await DB.get("current");
+    if(cur&&cur.buf){
+      await loadAudio(new Blob([cur.buf],{type:cur.type}), cur.name, cur.isRec, false);
+      const r=st.resumeAt||0;
+      if(audio && r>1 && r*SR<audio.length-SR){ setResume(r); notice(`Transcription interrompue à ${short(r)}. Touchez « Reprendre » pour continuer.`); $("status").textContent=""; }
+      else if(st.tx) notice("Votre dernière transcription a été restaurée.");
+    }else if(st.tx) notice("Votre dernière transcription a été restaurée.");
+  }catch(e){}
+})();
 </script>
 </body>
 </html>
